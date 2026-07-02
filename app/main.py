@@ -45,21 +45,31 @@ async def shutdown_event():
 async def run_graph_stream(request: ResearchRequest) -> AsyncGenerator[str, None]:
     """
     Executes LangGraph asynchronously, broadcasting real-time SSE updates.
+    Resumes from checkpoint if an active session exists.
     """
     thread_id = request.thread_id or "default_thread_session"
     config = {"configurable": {"thread_id": thread_id}}
     
-    # Initialize the input state
-    inputs = {
-        "research_query": request.research_query,
-        "gathered_raw_data": [],
-        "financial_metrics": {},
-        "report_markdown": "",
-        "agent_history": [],
-        "current_status": "Starting multi-agent workflow.",
-        "feedback": None,
-        "next_node_override": None
-    }
+    # Check if there is already an existing state / checkpoint
+    state_snapshot = await graph.aget_state(config)
+    
+    if state_snapshot and state_snapshot.next:
+        # Resume execution
+        inputs = None
+        logger.info(f"Resuming thread {thread_id} from current checkpoint.")
+    else:
+        # Initialize the input state
+        inputs = {
+            "research_query": request.research_query,
+            "gathered_raw_data": [],
+            "financial_metrics": {},
+            "report_markdown": "",
+            "agent_history": [],
+            "current_status": "Starting multi-agent workflow.",
+            "feedback": None,
+            "next_node_override": None
+        }
+        logger.info(f"Starting new research workflow for thread {thread_id}.")
     
     try:
         # Stream events from LangGraph
@@ -105,16 +115,30 @@ async def run_graph_stream(request: ResearchRequest) -> AsyncGenerator[str, None
                 yield f"event: agent_end\ndata: {json.dumps(payload)}\n\n"
                 await asyncio.sleep(0.05)
 
-        # Retrieve final state from checkpointer
+        # Retrieve current state from checkpointer to verify if it was interrupted
         state_snapshot = await graph.aget_state(config)
         final_values = state_snapshot.values if state_snapshot else {}
-        
-        end_payload = {
-            "report_markdown": final_values.get("report_markdown", ""),
-            "status": final_values.get("current_status", "completed"),
-            "agent_history": final_values.get("agent_history", [])
-        }
-        yield f"event: graph_end\ndata: {json.dumps(end_payload)}\n\n"
+        next_nodes = list(state_snapshot.next) if state_snapshot and state_snapshot.next else []
+
+        if next_nodes:
+            # Graph execution is paused (interrupted) e.g., on the critic node
+            payload = {
+                "next_nodes": next_nodes,
+                "values": {
+                    "report_markdown": final_values.get("report_markdown", ""),
+                    "current_status": final_values.get("current_status", "interrupted"),
+                    "feedback": final_values.get("feedback")
+                }
+            }
+            yield f"event: graph_interrupt\ndata: {json.dumps(payload)}\n\n"
+        else:
+            # Finished completely
+            end_payload = {
+                "report_markdown": final_values.get("report_markdown", ""),
+                "status": final_values.get("current_status", "completed"),
+                "agent_history": final_values.get("agent_history", [])
+            }
+            yield f"event: graph_end\ndata: {json.dumps(end_payload)}\n\n"
 
     except asyncio.CancelledError:
         logger.warning("Research stream execution client cancelled.")
@@ -134,6 +158,68 @@ async def stream_research(request: ResearchRequest):
         run_graph_stream(request),
         media_type="text/event-stream"
     )
+
+@app.post("/api/v1/research/approve")
+async def approve_research(request: HumanApprovalRequest):
+    """
+    Approve or reject a research report, providing feedback to refine the agent swarm routing.
+    """
+    config = {"configurable": {"thread_id": request.thread_id}}
+    state_snapshot = await graph.aget_state(config)
+    
+    if not state_snapshot or not state_snapshot.next:
+        raise HTTPException(status_code=400, detail="No active graph execution or interrupt found for this thread.")
+        
+    feedback_text = request.feedback
+    next_override = "supervisor"
+    
+    if not request.approved:
+        if not feedback_text:
+            feedback_text = "Rejected by human operator. Please revise the report."
+        status_msg = f"Rejected by human operator: {feedback_text}"
+    else:
+        status_msg = "Approved by human operator."
+        # If approved, we will tell the supervisor that it's approved by clearing feedback and letting supervisor route to END
+        feedback_text = None
+        
+    # Update the graph state as if it came from the critic node
+    await graph.aupdate_state(
+        config,
+        {
+            "feedback": feedback_text,
+            "next_node_override": next_override,
+            "current_status": status_msg,
+            "agent_history": [{
+                "node": "human_operator",
+                "message": f"Operator decision: approved={request.approved}. Feedback: {feedback_text}"
+            }]
+        },
+        as_node="critic"
+    )
+    
+    return {"status": "resumed", "approved": request.approved}
+
+@app.get("/api/v1/research/history/{thread_id}")
+async def get_research_history(thread_id: str):
+    """
+    Fetches checkpoint state history for time-travel navigation.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    history = []
+    
+    async for state in graph.aget_state_history(config):
+        history.append({
+            "checkpoint_id": state.config.get("configurable", {}).get("checkpoint_id"),
+            "values": {
+                "research_query": state.values.get("research_query"),
+                "current_status": state.values.get("current_status"),
+                "report_markdown": state.values.get("report_markdown"),
+                "feedback": state.values.get("feedback")
+            },
+            "next": list(state.next) if state.next else []
+        })
+        
+    return {"thread_id": thread_id, "history": history}
 
 @app.get("/health")
 def health_check():

@@ -55,8 +55,11 @@ def compile_research_graph():
     # Configure checkpointer for time-travel state preservation
     checkpointer = MemorySaver()
     
-    # Compile the graph executable
-    compiled_graph = workflow.compile(checkpointer=checkpointer)
+    # Compile the graph executable with a Human interrupt after the Critic Node
+    compiled_graph = workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_after=["critic"]
+    )
     logger.info("LangGraph multi-agent swarm compiled successfully.")
     return compiled_graph
 
