@@ -1,6 +1,7 @@
 import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+from app.config import settings
 from app.state import ResearchState
 from app.agents.supervisor import get_supervisor_node
 from app.agents.researcher import get_researcher_node
@@ -52,8 +53,17 @@ def compile_research_graph():
     workflow.add_edge("analyst", "supervisor")
     workflow.add_edge("critic", "supervisor")
     
-    # Configure checkpointer for time-travel state preservation
-    checkpointer = MemorySaver()
+    # Configure checkpointer for time-travel state preservation (Postgres/Memory)
+    checkpointer = None
+    try:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        # PostgresSaver.from_conn_string manages connection pooling automatically
+        checkpointer = PostgresSaver.from_conn_string(settings.DATABASE_URL)
+        checkpointer.setup()
+        logger.info("Using PostgreSQL PostgresSaver checkpointer.")
+    except Exception as e:
+        logger.warning(f"PostgresSaver initialization failed ({e}). Falling back to MemorySaver.")
+        checkpointer = MemorySaver()
     
     # Compile the graph executable with a Human interrupt after the Critic Node
     compiled_graph = workflow.compile(
